@@ -18,6 +18,8 @@ import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
+from optim import NiNo
+from graph import NeuralGraphNanoGPT
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 
 # -----------------------------------------------------------------------------
@@ -525,6 +527,51 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(1728 * x, n=128)
     return get_window_size_blocks_helper(window_size)
 
+# NiNo
+nino = NiNo(base_opt=None,
+               ckpt='../nino/checkpoints/nino_no_posw.pt',  # assume same root
+               model=None,
+               period=1000,
+               max_train_steps=args.num_iterations,
+               nino_device='cpu',
+               message_passing_device='cpu',
+               verbose=1,
+               p=2,
+               subgraph=False, # can be set to True for per-block prediction to fit on GPU memory (use nino_device='auto' in this case)
+               upd_scale=0.2,  # set to 0.2 instead of 1 to avoid divergence caused by prediction
+               edge_sample_ratio=0.2,
+               chunk_size=int(10**6))
+neural_graph_cls = NeuralGraphNanoGPT
+num_heads = None
+for m in model.modules():
+    if hasattr(m, 'num_heads'):
+        num_heads = m.num_heads
+        break
+
+# Compute or load LPE features of the graph
+graph_feat_path = 'nano_gpt_graph.pt'
+if os.path.exists(graph_feat_path):
+    print('loading cached graph lpe from', graph_feat_path, flush=True)
+    lpe = torch.load(graph_feat_path)
+    print('loaded graph lpe', len(lpe) if isinstance(lpe, list) else lpe.shape)
+else:
+    lpe = None
+nino.set_model(model, lpe=lpe, neural_graph_cls=NeuralGraphNanoGPT, block_name='blocks.', num_heads=num_heads)  # construct the neural graph
+if not os.path.exists(graph_feat_path):
+    # save LPE features for future use
+    if isinstance(nino.graph, list):
+        pos_lst = []
+        for g in nino.graph:
+            if hasattr(g.pyg_graph, 'pos') and g.pyg_graph.pos is not None:
+                pos_lst.append(g.pyg_graph.pos)
+        print(f'saving graph lpe {len(pos_lst)}-{pos_lst[0].shape} to', graph_feat_path, flush=True)
+        torch.save(pos_lst, graph_feat_path)
+    else:
+        if hasattr(nino.graph.pyg_graph, 'pos') and nino.graph.pyg_graph.pos is not None:
+            print(f'saving graph lpe {nino.graph.pyg_graph.pos.shape} to', graph_feat_path, flush=True)
+            torch.save(nino.graph.pyg_graph.pos, graph_feat_path)
+
+
 model: nn.Module = torch.compile(model, dynamic=False)
 
 ########################################
@@ -597,6 +644,19 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
+
+    if (step > 0 and step % (nino.period // nino.ctx) == 0) and (len(nino.states) == nino.ctx - 1):
+        print('step %d, nino step %d, running nino prediction...' % (step, nino.step_idx), flush=True)
+        nino.step_idx = step - 1  # -1 to properly compute k
+        nino.step()  # will add the current state to the states and perform the prediction
+        continue
+    elif (step > 0 and step % (nino.period // nino.ctx) == 0):
+        # just add the step and keep training
+        nino.states.append(torch.cat([p.data.view(-1).to('cpu').float() for p in nino._model.parameters()]))
+        print('step %d, nino step %d, adding state %d' % (step, nino.step_idx, len(nino.states)), flush=True)
+
+    nino.step_idx += 1
+
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(step)).backward()
     for param in model.parameters():
